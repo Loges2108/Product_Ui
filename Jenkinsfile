@@ -12,15 +12,6 @@ pipeline {
         skipDefaultCheckout(true)
     }
 
-    environment {
-        SHOULD_DEPLOY = 'false'
-        DEPLOY_ENV = ''
-        EXPECTED_BRANCH = ''
-        SOURCE_BRANCH = ''
-        DEPLOY_DIR = ''
-        COMMIT_SHA = ''
-    }
-
     stages {
 
         // --------------------------------------------------
@@ -35,22 +26,25 @@ pipeline {
                         env.DEPLOY_ENV = 'DEV'
                         env.EXPECTED_BRANCH = 'DEV'
                         env.DEPLOY_DIR = '/var/www/product-ui/dev/dist'
+                        env.SOURCE_BRANCH = ''
                     } else if (jobName.endsWith('_SIT')) {
                         env.DEPLOY_ENV = 'SIT'
                         env.EXPECTED_BRANCH = 'SIT'
-                        env.SOURCE_BRANCH = 'DEV'
                         env.DEPLOY_DIR = '/var/www/product-ui/sit/dist'
+                        env.SOURCE_BRANCH = 'DEV'
                     } else if (jobName.endsWith('_UAT')) {
                         env.DEPLOY_ENV = 'UAT'
                         env.EXPECTED_BRANCH = 'UAT'
-                        env.SOURCE_BRANCH = 'SIT'
                         env.DEPLOY_DIR = '/var/www/product-ui/uat/dist'
+                        env.SOURCE_BRANCH = 'SIT'
                     } else {
                         error(
-                            "Unknown job name: ${env.JOB_NAME}. " +
+                            "Unknown Jenkins job name: ${env.JOB_NAME}. " +
                             "Expected suffix _DEV, _SIT, or _UAT."
                         )
                     }
+
+                    env.SHOULD_DEPLOY = 'false'
 
                     echo "Jenkins Job      : ${env.JOB_NAME}"
                     echo "Deployment Env   : ${env.DEPLOY_ENV}"
@@ -86,11 +80,11 @@ pipeline {
                         ACTUAL_COMMIT="$(git rev-parse HEAD)"
                         BRANCH_COMMIT="$(git rev-parse "refs/remotes/origin/${EXPECTED_BRANCH}")"
 
-                        echo "HEAD commit:   ${ACTUAL_COMMIT}"
-                        echo "Branch commit: ${BRANCH_COMMIT}"
+                        echo "HEAD commit:   $ACTUAL_COMMIT"
+                        echo "Branch commit: $BRANCH_COMMIT"
 
                         if [ "$ACTUAL_COMMIT" != "$BRANCH_COMMIT" ]; then
-                            echo "ERROR: Checked-out commit does not match the configured environment branch."
+                            echo "ERROR: Checkout does not match the expected branch."
                             exit 1
                         fi
                     '''
@@ -108,7 +102,11 @@ pipeline {
 
                     test -f package.json
                     test -f package-lock.json
-                    test -f vite.config.js || test -f vite.config.ts
+
+                    if [ ! -f vite.config.js ] && [ ! -f vite.config.ts ]; then
+                        echo "ERROR: Vite configuration file not found."
+                        exit 1
+                    fi
 
                     if [ ! -f src/main.jsx ] && [ ! -f src/main.tsx ]; then
                         echo "ERROR: src/main.jsx or src/main.tsx was not found."
@@ -121,7 +119,10 @@ pipeline {
         }
 
         // --------------------------------------------------
-        // 4. Validate DEV -> SIT -> UAT promotion
+        // 4. Validate promotion
+        // DEV: direct deployment
+        // SIT: merge from DEV
+        // UAT: merge from SIT
         // --------------------------------------------------
         stage('Validate Promotion') {
             steps {
@@ -130,11 +131,11 @@ pipeline {
                         env.SHOULD_DEPLOY = 'true'
                         echo 'DEV deployment is allowed.'
                     } else {
-                        def validationResult = sh(
+                        int validationResult = sh(
                             script: '''
                                 set -eu
 
-                                echo "Checking promotion into ${EXPECTED_BRANCH}"
+                                echo "Target branch: ${EXPECTED_BRANCH}"
                                 echo "Required source branch: ${SOURCE_BRANCH}"
 
                                 git fetch origin \
@@ -143,7 +144,7 @@ pipeline {
                                 PARENT_LINE="$(git rev-list --parents -n 1 HEAD)"
                                 PARENT_COUNT="$(echo "$PARENT_LINE" | awk '{print NF - 1}')"
 
-                                echo "Merge parent count: ${PARENT_COUNT}"
+                                echo "Merge parent count: $PARENT_COUNT"
 
                                 if [ "$PARENT_COUNT" -lt 2 ]; then
                                     echo "SKIP: Current commit is not a merge commit."
@@ -152,7 +153,7 @@ pipeline {
 
                                 SOURCE_PARENT="$(git rev-parse HEAD^2)"
 
-                                echo "Merged source commit: ${SOURCE_PARENT}"
+                                echo "Merged source commit: $SOURCE_PARENT"
 
                                 if git merge-base --is-ancestor \
                                     "$SOURCE_PARENT" \
@@ -160,7 +161,7 @@ pipeline {
                                     echo "Promotion validation passed."
                                     exit 0
                                 else
-                                    echo "SKIP: The second merge parent is not in ${SOURCE_BRANCH} history."
+                                    echo "SKIP: The merged source commit is not in ${SOURCE_BRANCH} history."
                                     exit 10
                                 fi
                             ''',
@@ -173,8 +174,8 @@ pipeline {
                             env.SHOULD_DEPLOY = 'false'
                         } else {
                             error(
-                                "Promotion validation failed due to a Git error. " +
-                                "Deployment is blocked."
+                                'Git promotion validation failed. ' +
+                                'Deployment is blocked.'
                             )
                         }
                     }
@@ -185,12 +186,12 @@ pipeline {
         }
 
         // --------------------------------------------------
-        // 5. Build and publish UI
+        // 5. Build and deploy UI using the deployment helper
         // --------------------------------------------------
         stage('Build and Deploy UI') {
             when {
                 expression {
-                    return env.SHOULD_DEPLOY == 'true'
+                    env.SHOULD_DEPLOY == 'true'
                 }
             }
 
@@ -198,7 +199,7 @@ pipeline {
                 sh '''
                     set -eu
 
-                    echo "Deploying ${DEPLOY_ENV}"
+                    echo "Deploying UI environment: ${DEPLOY_ENV}"
                     echo "Branch: ${EXPECTED_BRANCH}"
                     echo "Commit: ${COMMIT_SHA}"
 
@@ -212,12 +213,12 @@ pipeline {
         }
 
         // --------------------------------------------------
-        // 6. Verify published frontend files
+        // 6. Verify published frontend
         // --------------------------------------------------
         stage('Verify Published Output') {
             when {
                 expression {
-                    return env.SHOULD_DEPLOY == 'true'
+                    env.SHOULD_DEPLOY == 'true'
                 }
             }
 
@@ -225,7 +226,7 @@ pipeline {
                 sh '''
                     set -eu
 
-                    echo "Checking published UI: ${DEPLOY_DIR}/index.html"
+                    echo "Checking: ${DEPLOY_DIR}/index.html"
 
                     test -s "${DEPLOY_DIR}/index.html"
 
@@ -240,7 +241,7 @@ pipeline {
         stage('Deployment Skipped') {
             when {
                 expression {
-                    return env.SHOULD_DEPLOY != 'true'
+                    env.SHOULD_DEPLOY != 'true'
                 }
             }
 
@@ -265,12 +266,12 @@ pipeline {
         }
 
         failure {
-            echo "UI pipeline failed for ${env.DEPLOY_ENV}. Review the console output."
+            echo "UI pipeline failed for ${env.DEPLOY_ENV ?: 'unknown environment'}."
         }
 
         always {
             echo "Job: ${env.JOB_NAME}"
-            echo "Build: #${env.BUILD_NUMBER}"
+            echo "Build: ${env.BUILD_NUMBER}"
         }
     }
 }
