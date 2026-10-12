@@ -1,3 +1,4 @@
+
 pipeline {
     agent any
 
@@ -12,7 +13,8 @@ pipeline {
 
     environment {
         UI_REPO = 'https://github.com/Loges2108/Product_Ui.git'
-        EMAIL_TO = 'aws.saquib@gmail.com'
+        EMAIL_TO = 'logeswaran2108@gmail.com'
+        SHOULD_DEPLOY = 'false'
     }
 
     stages {
@@ -37,33 +39,46 @@ pipeline {
                         env.DEPLOY_ENV = 'UAT'
                         env.GIT_BRANCH = 'UAT'
                     } else {
-                        error("Unsupported UI job: ${env.JOB_NAME}")
+                        error(
+                            "Unsupported UI job: ${env.JOB_NAME}. " +
+                            "Use Product_UI_DEV, Product_UI_SIT, or Product_UI_UAT."
+                        )
                     }
 
-                    env.ENV_FILE = "/var/www/product-ui/.env.${env.DEPLOY_ENV.toLowerCase()}"
-                    env.DEPLOY_DIR = "/var/www/product-ui/${env.DEPLOY_ENV.toLowerCase()}/dist"
-                    env.API_BASE_URL = "http://prod-${env.DEPLOY_ENV.toLowerCase()}.work.gd/api"
+                    env.ENV_FILE =
+                        "/var/www/product-ui/.env.${env.DEPLOY_ENV.toLowerCase()}"
 
-                    echo "Deploy environment: ${env.DEPLOY_ENV}"
-                    echo "Git branch: ${env.GIT_BRANCH}"
-                    echo "Env file: ${env.ENV_FILE}"
-                    echo "Deploy dir: ${env.DEPLOY_DIR}"
+                    env.DEPLOY_DIR =
+                        "/var/www/product-ui/${env.DEPLOY_ENV.toLowerCase()}/dist"
+
+                    echo "Environment: ${env.DEPLOY_ENV}"
+                    echo "Branch: ${env.GIT_BRANCH}"
                 }
             }
         }
 
         stage('Checkout') {
             steps {
-                git branch: "${env.GIT_BRANCH}", url: "${env.UI_REPO}", poll: true, changelog: true
+                checkout scm
             }
         }
 
-        stage('Identify Commit Author') {
+        stage('Identify Commit') {
             steps {
-                sh '''
-                    set +e
-                    git log -1 --pretty=format:'%an <%ae>' || true
-                '''
+                script {
+                    env.COMMIT_SHA = sh(
+                        script: 'git rev-parse HEAD',
+                        returnStdout: true
+                    ).trim()
+
+                    env.COMMIT_AUTHOR = sh(
+                        script: "git log -1 --pretty=format:'%an <%ae>'",
+                        returnStdout: true
+                    ).trim()
+
+                    echo "Commit: ${env.COMMIT_SHA}"
+                    echo "Author: ${env.COMMIT_AUTHOR}"
+                }
             }
         }
 
@@ -80,46 +95,93 @@ pipeline {
             }
         }
 
-        stage('Install Dependencies') {
+        stage('Validate Promotion') {
             steps {
-                sh '''
-                    set -eu
-                    npm ci --no-audit --no-fund
-                '''
+                script {
+                    if (env.DEPLOY_ENV == 'DEV') {
+                        env.SHOULD_DEPLOY = 'true'
+                        echo "DEV change: deployment enabled."
+                    } else {
+                        def sourceBranch =
+                            env.DEPLOY_ENV == 'SIT' ? 'DEV' : 'SIT'
+
+                        def parentCount = sh(
+                            script: "git rev-list --parents -n 1 HEAD | awk '{print NF-1}'",
+                            returnStdout: true
+                        ).trim().toInteger()
+
+                        if (parentCount < 2) {
+                            env.SHOULD_DEPLOY = 'false'
+                            echo "SKIPPED: Not a merge commit."
+                        } else {
+                            sh """
+                                set -eu
+                                git fetch origin \
+                                  +refs/heads/${sourceBranch}:refs/remotes/origin/${sourceBranch}
+                            """
+
+                            def sourceParent = sh(
+                                script: 'git rev-parse HEAD^2',
+                                returnStdout: true
+                            ).trim()
+
+                            def sourceIsValid = sh(
+                                script: """
+                                    git merge-base --is-ancestor \
+                                      '${sourceParent}' \
+                                      'refs/remotes/origin/${sourceBranch}'
+                                """,
+                                returnStatus: true
+                            ) == 0
+
+                            if (sourceIsValid) {
+                                env.SHOULD_DEPLOY = 'true'
+                                echo "Valid promotion merge from ${sourceBranch}."
+                            } else {
+                                env.SHOULD_DEPLOY = 'false'
+                                echo "SKIPPED: Merge source is not in ${sourceBranch} history."
+                            }
+                        }
+                    }
+                }
             }
         }
 
-        stage('Build and Publish Frontend') {
+        stage('Build and Publish UI') {
+            when {
+                expression { env.SHOULD_DEPLOY == 'true' }
+            }
             steps {
                 sh '''
                     set -eu
-                    test -n "${ENV_FILE}"
                     test -f "${ENV_FILE}"
 
-                    chmod +x ./deploy-product-ui 2>/dev/null || true
-                    ./deploy-product-ui "${DEPLOY_ENV}" "${WORKSPACE}"
+                    sudo -n /usr/local/sbin/deploy-product-ui \
+                        "${DEPLOY_ENV}" \
+                        "${WORKSPACE}"
                 '''
             }
         }
 
         stage('Verify Published Output') {
+            when {
+                expression { env.SHOULD_DEPLOY == 'true' }
+            }
             steps {
                 sh '''
                     set -eu
-                    test -f "${DEPLOY_DIR}/index.html"
-                    curl --fail --silent --show-error \
-                      --retry 10 --retry-delay 3 \
-                      "file://${DEPLOY_DIR}/index.html" >/dev/null
+                    test -s "${DEPLOY_DIR}/index.html"
+                    echo "Published frontend verified"
                 '''
             }
         }
 
-        stage('Cleanup') {
+        stage('Deployment Skipped') {
+            when {
+                expression { env.SHOULD_DEPLOY != 'true' }
+            }
             steps {
-                sh '''
-                    set +e
-                    rm -rf .cache .vite dist 2>/dev/null || true
-                '''
+                echo "No UI deployment performed: promotion rule was not satisfied."
             }
         }
     }
@@ -127,27 +189,48 @@ pipeline {
     post {
         success {
             script {
+                def outcome = env.SHOULD_DEPLOY == 'true'
+                    ? 'Deployment succeeded'
+                    : 'Build completed; deployment skipped'
+
                 try {
                     emailext(
                         to: "${env.EMAIL_TO}",
-                        subject: "${env.JOB_NAME} build succeeded (${env.DEPLOY_ENV})",
-                        body: "Frontend build and publish succeeded for ${env.JOB_NAME} on ${env.GIT_BRANCH}.\nCommit author: ${env.GIT_COMMIT?:'unknown'}"
+                        subject: "${env.JOB_NAME}: ${outcome}",
+                        body: """${outcome}
+
+Job: ${env.JOB_NAME}
+Environment: ${env.DEPLOY_ENV}
+Branch: ${env.GIT_BRANCH}
+Commit: ${env.COMMIT_SHA ?: 'unknown'}
+Author: ${env.COMMIT_AUTHOR ?: 'unknown'}
+Build: ${env.BUILD_URL}
+"""
                     )
                 } catch (Exception err) {
-                    echo "Email notification skipped: ${err.getMessage()}"
+                    echo "Email notification failed: ${err.getMessage()}"
                 }
             }
         }
+
         failure {
             script {
                 try {
                     emailext(
                         to: "${env.EMAIL_TO}",
-                        subject: "${env.JOB_NAME} build failed (${env.DEPLOY_ENV})",
-                        body: "Frontend build failed for ${env.JOB_NAME} on ${env.GIT_BRANCH}.\nCheck Jenkins logs for details."
+                        subject: "${env.JOB_NAME}: UI pipeline failed",
+                        body: """UI pipeline failed.
+
+Job: ${env.JOB_NAME}
+Environment: ${env.DEPLOY_ENV ?: 'unknown'}
+Branch: ${env.GIT_BRANCH ?: 'unknown'}
+Build: ${env.BUILD_URL}
+
+Check Jenkins Console Output for the error.
+"""
                     )
                 } catch (Exception err) {
-                    echo "Email notification skipped: ${err.getMessage()}"
+                    echo "Email notification failed: ${err.getMessage()}"
                 }
             }
         }

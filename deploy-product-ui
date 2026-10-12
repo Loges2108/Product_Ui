@@ -1,91 +1,110 @@
+
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-usage() {
-  echo "Usage: $0 <DEV|SIT|UAT> <workspace>" >&2
-}
-
 if [[ $# -ne 2 ]]; then
-  usage
+  echo "Usage: $0 <DEV|SIT|UAT> <workspace>" >&2
   exit 1
 fi
 
 ENV_NAME="${1^^}"
-WORKSPACE="${2}"
+WORKSPACE="$(realpath "$2")"
+APP_ROOT="/var/www/product-ui"
+NODE_BIN="/home/ec2-user/.nvm/versions/node/v22.13.0/bin"
+RUN_AS_EC2="/usr/sbin/runuser"
 
-case "${ENV_NAME}" in
-  DEV|SIT|UAT)
-    ;;
+case "$ENV_NAME" in
+  DEV) BASE_URL="http://prod-dev.work.gd/api" ;;
+  SIT) BASE_URL="http://prod-sit.work.gd/api" ;;
+  UAT) BASE_URL="http://prod-uat.work.gd/api" ;;
   *)
-    echo "Unsupported environment: ${ENV_NAME}" >&2
+    echo "Unsupported environment: $ENV_NAME" >&2
     exit 1
     ;;
- esac
+esac
 
-if [[ -z "${WORKSPACE}" || ! -d "${WORKSPACE}" ]]; then
-  echo "Workspace directory not found: ${WORKSPACE}" >&2
+ENV_LOWER="${ENV_NAME,,}"
+APP_DIR="$APP_ROOT/$ENV_LOWER"
+DIST_DIR="$APP_DIR/dist"
+ENV_FILE="$APP_ROOT/.env.$ENV_LOWER"
+
+if [[ "$(id -u)" -ne 0 ]]; then
+  echo "Run this helper through sudo." >&2
   exit 1
 fi
 
-APP_ROOT="/var/www/product-ui"
-APP_DIR="${APP_ROOT}/${ENV_NAME,,}"
-DIST_DIR="${APP_DIR}/dist"
-ENV_FILE="${APP_ROOT}/.env.${ENV_NAME,,}"
-BASE_URL="http://prod-${ENV_NAME,,}.work.gd/api"
-
-if [[ ! -f "${ENV_FILE}" ]]; then
-  echo "Environment file is missing: ${ENV_FILE}" >&2
+if [[ ! -d "$WORKSPACE" ||
+      ! -f "$WORKSPACE/package.json" ||
+      ! -f "$WORKSPACE/package-lock.json" ]]; then
+  echo "Invalid Jenkins workspace: $WORKSPACE" >&2
   exit 1
 fi
 
-if [[ ! -f "${WORKSPACE}/package.json" ]]; then
-  echo "package.json not found in workspace: ${WORKSPACE}" >&2
+if [[ ! -r "$ENV_FILE" ]]; then
+  echo "Environment file missing or unreadable: $ENV_FILE" >&2
   exit 1
 fi
 
-mkdir -p "${DIST_DIR}"
-
-cd "${WORKSPACE}"
-
-echo "==> Installing frontend dependencies"
-npm ci --no-audit --no-fund
-
-set -a
-# shellcheck disable=SC1090
-source "${ENV_FILE}"
-set +a
-
-export VITE_ENV="${ENV_NAME}"
-export VITE_API_BASE_URL="${BASE_URL}"
-
-echo "==> Building ${ENV_NAME} frontend"
-if ! npm run build; then
-  echo "Frontend build failed for ${ENV_NAME}" >&2
+if [[ ! -x "$RUN_AS_EC2" ||
+      ! -x "$NODE_BIN/node" ||
+      ! -x "$NODE_BIN/npm" ]]; then
+  echo "runuser or Node.js installation is missing." >&2
   exit 1
 fi
 
-if [[ ! -f "dist/index.html" ]]; then
-  echo "dist/index.html was not generated for ${ENV_NAME}" >&2
+for file in vite.config.js src/main.jsx; do
+  if [[ ! -f "$WORKSPACE/$file" ]]; then
+    echo "Required UI file missing: $WORKSPACE/$file" >&2
+    exit 1
+  fi
+done
+
+echo "==> Deploying $ENV_NAME UI"
+echo "==> Source: $WORKSPACE"
+echo "==> Target: $APP_DIR"
+
+install -d -o ec2-user -g ec2-user "$APP_DIR"
+
+# Preserve environment files and copy only the selected branch's source.
+rsync -a --delete \
+  --exclude='.git/' \
+  --exclude='node_modules/' \
+  --exclude='dist/' \
+  --exclude='.env' \
+  --exclude='.env.*' \
+  "$WORKSPACE/" "$APP_DIR/"
+
+chown -R ec2-user:ec2-user "$APP_DIR"
+
+echo "==> Installing dependencies"
+
+"$RUN_AS_EC2" -u ec2-user -- env \
+  HOME=/home/ec2-user \
+  PATH="$NODE_BIN:/usr/local/bin:/usr/bin:/bin" \
+  bash -c 'cd "$1" && npm ci --no-audit --no-fund' \
+  _ "$APP_DIR"
+
+echo "==> Building frontend"
+
+"$RUN_AS_EC2" -u ec2-user -- env \
+  HOME=/home/ec2-user \
+  PATH="$NODE_BIN:/usr/local/bin:/usr/bin:/bin" \
+  VITE_ENV="$ENV_NAME" \
+  VITE_API_BASE_URL="$BASE_URL" \
+  bash -c 'cd "$1" && npm run build' \
+  _ "$APP_DIR"
+
+if [[ ! -s "$DIST_DIR/index.html" ]]; then
+  echo "Build did not produce $DIST_DIR/index.html" >&2
   exit 1
 fi
 
-if [[ -d "${DIST_DIR}" ]]; then
-  find "${DIST_DIR}" -mindepth 1 -maxdepth 1 ! -name '.keep' -exec rm -rf {} +
+if ! id nginx >/dev/null 2>&1; then
+  echo "Nginx user does not exist; verify Nginx installation." >&2
+  exit 1
 fi
 
-cp -a "dist/." "${DIST_DIR}/"
+chown -R nginx:nginx "$DIST_DIR"
+chmod -R u=rwX,go=rX "$DIST_DIR"
 
-if ! id -u nginx >/dev/null 2>&1; then
-  OWNER="$(id -un)"
-  GROUP="$(id -gn)"
-else
-  OWNER="nginx"
-  GROUP="nginx"
-fi
-
-if [[ "$(id -u)" -eq 0 ]]; then
-  chown -R "${OWNER}:${GROUP}" "${DIST_DIR}"
-  chmod -R u=rwX,go=rX "${DIST_DIR}"
-fi
-
-echo "==> Frontend deployment complete for ${ENV_NAME}"
+echo "==> Frontend deployment successful for $ENV_NAME"
