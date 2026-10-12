@@ -1,0 +1,91 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+usage() {
+  echo "Usage: $0 <DEV|SIT|UAT> <workspace>" >&2
+}
+
+if [[ $# -ne 2 ]]; then
+  usage
+  exit 1
+fi
+
+ENV_NAME="${1^^}"
+WORKSPACE="${2}"
+
+case "${ENV_NAME}" in
+  DEV|SIT|UAT)
+    ;;
+  *)
+    echo "Unsupported environment: ${ENV_NAME}" >&2
+    exit 1
+    ;;
+ esac
+
+if [[ -z "${WORKSPACE}" || ! -d "${WORKSPACE}" ]]; then
+  echo "Workspace directory not found: ${WORKSPACE}" >&2
+  exit 1
+fi
+
+APP_ROOT="/var/www/product-ui"
+APP_DIR="${APP_ROOT}/${ENV_NAME,,}"
+DIST_DIR="${APP_DIR}/dist"
+ENV_FILE="${APP_ROOT}/.env.${ENV_NAME,,}"
+BASE_URL="http://prod-${ENV_NAME,,}.work.gd/api"
+
+if [[ ! -f "${ENV_FILE}" ]]; then
+  echo "Environment file is missing: ${ENV_FILE}" >&2
+  exit 1
+fi
+
+if [[ ! -f "${WORKSPACE}/package.json" ]]; then
+  echo "package.json not found in workspace: ${WORKSPACE}" >&2
+  exit 1
+fi
+
+mkdir -p "${DIST_DIR}"
+
+cd "${WORKSPACE}"
+
+echo "==> Installing frontend dependencies"
+npm ci --no-audit --no-fund
+
+set -a
+# shellcheck disable=SC1090
+source "${ENV_FILE}"
+set +a
+
+export VITE_ENV="${ENV_NAME}"
+export VITE_API_BASE_URL="${BASE_URL}"
+
+echo "==> Building ${ENV_NAME} frontend"
+if ! npm run build; then
+  echo "Frontend build failed for ${ENV_NAME}" >&2
+  exit 1
+fi
+
+if [[ ! -f "dist/index.html" ]]; then
+  echo "dist/index.html was not generated for ${ENV_NAME}" >&2
+  exit 1
+fi
+
+if [[ -d "${DIST_DIR}" ]]; then
+  find "${DIST_DIR}" -mindepth 1 -maxdepth 1 ! -name '.keep' -exec rm -rf {} +
+fi
+
+cp -a "dist/." "${DIST_DIR}/"
+
+if ! id -u nginx >/dev/null 2>&1; then
+  OWNER="$(id -un)"
+  GROUP="$(id -gn)"
+else
+  OWNER="nginx"
+  GROUP="nginx"
+fi
+
+if [[ "$(id -u)" -eq 0 ]]; then
+  chown -R "${OWNER}:${GROUP}" "${DIST_DIR}"
+  chmod -R u=rwX,go=rX "${DIST_DIR}"
+fi
+
+echo "==> Frontend deployment complete for ${ENV_NAME}"
